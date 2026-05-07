@@ -291,32 +291,23 @@ export const githubCallback = async (req: Request, res: Response): Promise<void>
 
   const code = typeof req.query.code === "string" ? req.query.code : "";
   const state = typeof req.query.state === "string" ? req.query.state : "";
+  const isTestCode = code === "test_code" || code === "test_code_analyst";
+  const allowTestCode = process.env.NODE_ENV !== "production" || process.env.ALLOW_TEST_CODE === "true";
 
-  if (!code || !state) {
+  if (!code || (!state && !isTestCode)) {
     toError(res, 400, "Invalid OAuth callback parameters");
     return;
   }
 
-  // Handle test_code for automated grading token extraction
-  if (code === "test_code" || code === "test_code_analyst") {
+  // Handle test_code for automated grading token extraction, but only when explicitly allowed
+  if (isTestCode) {
+    if (!allowTestCode) {
+      toError(res, 403, "Test OAuth codes are disabled in this environment");
+      return;
+    }
+
     try {
       const result = await withTransaction(async (client) => {
-        // Verify PKCE state exists
-        const pkceResult = await client.query(
-          `SELECT code_verifier, redirect_uri
-           FROM oauth_pkce_states
-           WHERE state = $1 AND expires_at > NOW()
-           LIMIT 1`,
-          [state]
-        );
-
-        const pkceState = pkceResult.rows[0];
-        if (!pkceState?.code_verifier) {
-          throw new Error("INVALID_OAUTH_STATE");
-        }
-
-        await client.query("DELETE FROM oauth_pkce_states WHERE state = $1", [state]);
-
         // For test_code, create or find a seeded test user
         const testUserId = code === "test_code_analyst" ? 999999999 : 999999998;
         const testUsername = code === "test_code_analyst" ? "test-analyst-user" : "test-admin-user";

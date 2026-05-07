@@ -6,7 +6,11 @@ import { PORT } from "./config";
 const app = createApp();
 
 const startServer = async (): Promise<void> => {
-  await initializeDatabase();
+  // Initialize database in background so the HTTP server can start quickly.
+  initializeDatabase()
+    .then(() => console.log("Database initialized"))
+    .catch((error) => console.error("Database initialization failed:", error));
+
   app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
   });

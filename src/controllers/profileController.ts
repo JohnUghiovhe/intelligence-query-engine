@@ -1,5 +1,9 @@
 import { Request, Response } from "express";
-import { pool } from "../db";
+import { once } from "node:events";
+import { PassThrough } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { from as copyFrom } from "pg-copy-streams";
+import { pool, withTransaction } from "../db";
 import { generateUuidV7 } from "../utils/crypto";
 import { toError } from "../utils/http";
 import {
@@ -58,11 +62,65 @@ type UploadCandidate = {
 
 const QUERY_CACHE_TTL_MS = 30_000;
 const QUERY_CACHE_MAX_ENTRIES = 250;
-const CSV_UPLOAD_BATCH_SIZE = 500;
 const queryCache = createInMemoryCache<QueryCachePayload | ProfileRow | UploadSummary>(
   QUERY_CACHE_MAX_ENTRIES,
   QUERY_CACHE_TTL_MS
 );
+
+const PROFILE_SECONDARY_INDEX_NAMES = [
+  "idx_profiles_gender",
+  "idx_profiles_age_group",
+  "idx_profiles_country_id",
+  "idx_profiles_age",
+  "idx_profiles_created_at",
+  "idx_profiles_created_at_id",
+  "idx_profiles_gender_created_at_id",
+  "idx_profiles_age_group_created_at_id",
+  "idx_profiles_country_id_created_at_id",
+  "idx_profiles_age_created_at_id",
+  "idx_profiles_gender_probability_created_at_id",
+  "idx_profiles_gender_probability",
+  "idx_profiles_country_probability",
+  "idx_profiles_country_name",
+  "idx_profiles_country_name_lower"
+] as const;
+
+const PROFILE_UNIQUE_INDEX_NAME = "ux_profiles_name_lower";
+const PROFILE_UNIQUE_INDEX_STATEMENT = "CREATE UNIQUE INDEX IF NOT EXISTS ux_profiles_name_lower ON profiles (LOWER(name))";
+
+const PROFILE_SECONDARY_INDEX_STATEMENTS = [
+  "CREATE INDEX IF NOT EXISTS idx_profiles_gender ON profiles(gender)",
+  "CREATE INDEX IF NOT EXISTS idx_profiles_age_group ON profiles(age_group)",
+  "CREATE INDEX IF NOT EXISTS idx_profiles_country_id ON profiles(country_id)",
+  "CREATE INDEX IF NOT EXISTS idx_profiles_age ON profiles(age)",
+  "CREATE INDEX IF NOT EXISTS idx_profiles_created_at ON profiles(created_at)",
+  "CREATE INDEX IF NOT EXISTS idx_profiles_created_at_id ON profiles(created_at DESC, id DESC)",
+  "CREATE INDEX IF NOT EXISTS idx_profiles_gender_created_at_id ON profiles(gender, created_at DESC, id DESC)",
+  "CREATE INDEX IF NOT EXISTS idx_profiles_age_group_created_at_id ON profiles(age_group, created_at DESC, id DESC)",
+  "CREATE INDEX IF NOT EXISTS idx_profiles_country_id_created_at_id ON profiles(country_id, created_at DESC, id DESC)",
+  "CREATE INDEX IF NOT EXISTS idx_profiles_age_created_at_id ON profiles(age, created_at DESC, id DESC)",
+  "CREATE INDEX IF NOT EXISTS idx_profiles_gender_probability_created_at_id ON profiles(gender_probability, created_at DESC, id DESC)",
+  "CREATE INDEX IF NOT EXISTS idx_profiles_gender_probability ON profiles(gender_probability)",
+  "CREATE INDEX IF NOT EXISTS idx_profiles_country_probability ON profiles(country_probability)",
+  "CREATE INDEX IF NOT EXISTS idx_profiles_country_name ON profiles(country_name)",
+  "CREATE INDEX IF NOT EXISTS idx_profiles_country_name_lower ON profiles(LOWER(country_name))"
+] as const;
+
+const dropProfileSecondaryIndexes = async (client: { query: (text: string) => Promise<unknown> }): Promise<void> => {
+  for (const indexName of PROFILE_SECONDARY_INDEX_NAMES) {
+    await client.query(`DROP INDEX IF EXISTS ${indexName}`);
+  }
+};
+
+const recreateProfileSecondaryIndexes = async (client: { query: (text: string) => Promise<unknown> }): Promise<void> => {
+  for (const statement of PROFILE_SECONDARY_INDEX_STATEMENTS) {
+    await client.query(statement);
+  }
+};
+
+const recreateProfileUniqueIndex = async (client: { query: (text: string) => Promise<unknown> }): Promise<void> => {
+  await client.query(PROFILE_UNIQUE_INDEX_STATEMENT);
+};
 
 const toIso = (value: unknown): string => {
   if (value instanceof Date) return value.toISOString();
@@ -107,6 +165,27 @@ const buildUploadReasonMap = (): Record<UploadReason, number> => ({
 
 const incrementReason = (reasons: Record<UploadReason, number>, reason: UploadReason, amount = 1): void => {
   reasons[reason] += amount;
+};
+
+const escapeCsvValue = (value: string): string => {
+  if (!/[",\r\n]/.test(value)) return value;
+  return `"${value.replace(/"/g, '""')}"`;
+};
+
+const serializeUploadCandidate = (candidate: UploadCandidate): string => {
+  const row = [
+    generateUuidV7(),
+    candidate.name,
+    candidate.gender,
+    candidate.gender_probability,
+    candidate.age,
+    candidate.age_group,
+    candidate.country_id,
+    candidate.country_name,
+    candidate.country_probability
+  ].map((value) => escapeCsvValue(String(value)));
+
+  return `${row.join(",")}\n`;
 };
 
 const getAgeFromRow = (value: string): number | null => {
@@ -173,62 +252,6 @@ const extractUploadCandidate = (
       country_probability: countryProbability
     }
   };
-};
-
-const getExistingNames = async (names: string[]): Promise<Set<string>> => {
-  if (names.length === 0) return new Set();
-  const result = await pool.query("SELECT LOWER(name) AS name FROM profiles WHERE LOWER(name) = ANY($1::text[])", [names]);
-  return new Set(result.rows.map((row) => String(row.name)));
-};
-
-const insertUploadBatch = async (
-  batch: UploadCandidate[],
-  reasons: Record<UploadReason, number>
-): Promise<{ inserted: number; skipped: number }> => {
-  const existing = await getExistingNames(batch.map((row) => row.name));
-  const insertable = batch.filter((row) => !existing.has(row.name));
-  incrementReason(reasons, "duplicate_name", batch.length - insertable.length);
-
-  if (insertable.length === 0) {
-    return { inserted: 0, skipped: batch.length };
-  }
-
-  const values: Array<string | number> = [];
-  const placeholders = insertable
-    .map((row, index) => {
-      const base = index * 9;
-      values.push(
-        generateUuidV7(),
-        row.name,
-        row.gender,
-        row.gender_probability,
-        row.age,
-        row.age_group,
-        row.country_id,
-        row.country_name,
-        row.country_probability
-      );
-      return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, NOW())`;
-    })
-    .join(", ");
-
-  const insertedResult = await pool.query(
-    `INSERT INTO profiles (
-      id, name, gender, gender_probability, age, age_group,
-      country_id, country_name, country_probability, created_at
-    ) VALUES ${placeholders}
-    ON CONFLICT (LOWER(name)) DO NOTHING
-    RETURNING LOWER(name) AS name`,
-    values
-  );
-
-  const insertedCount = insertedResult.rows.length;
-  const skipped = batch.length - insertedCount;
-  if (skipped > batch.length - insertable.length) {
-    incrementReason(reasons, "duplicate_name", skipped - (batch.length - insertable.length));
-  }
-
-  return { inserted: insertedCount, skipped };
 };
 
 const getAgeGroup = (age: number): ProfileRow["age_group"] => {
@@ -832,92 +855,175 @@ export const createProfileHandlers = () => {
       }
       const parser = new CsvRowParser();
       const summaryReasons = buildUploadReasonMap();
-      const seenNames = new Set<string>();
-      const pendingBatch: UploadCandidate[] = [];
       let headerIndex: Map<string, number> | null = null;
       let totalRows = 0;
+      let acceptedRows = 0;
       let inserted = 0;
-      let chain = Promise.resolve();
 
-      const flushBatch = async (): Promise<void> => {
-        if (pendingBatch.length === 0) return;
-        try {
-          const result = await insertUploadBatch([...pendingBatch], summaryReasons);
-          inserted += result.inserted;
-          clearQueryCache();
-        } catch {
-          incrementReason(summaryReasons, "database_error", pendingBatch.length);
-        } finally {
-          pendingBatch.length = 0;
-        }
-      };
+      // Get dedicated connection for COPY operation (not in transaction)
+      const client = await pool.connect();
+      let profileIndexesDropped = false;
+      let uniqueProfileIndexDropped = false;
+      try {
+        // Create temp table
+        await client.query(`
+          CREATE TEMP TABLE upload_profiles_stage (
+            id UUID NOT NULL,
+            name TEXT NOT NULL,
+            gender TEXT NOT NULL,
+            gender_probability DOUBLE PRECISION NOT NULL,
+            age INTEGER NOT NULL,
+            age_group TEXT NOT NULL,
+            country_id TEXT NOT NULL,
+            country_name TEXT NOT NULL,
+            country_probability DOUBLE PRECISION NOT NULL
+          );
+        `);
 
-      const processParsedRow = async (row: ParsedCsvRow): Promise<void> => {
-        if (headerIndex === null) {
-          const normalizedHeader = row.cells.map(normalizeCsvHeader);
-          headerIndex = new Map<string, number>();
-          normalizedHeader.forEach((value, index) => {
-            if (!headerIndex!.has(value)) headerIndex!.set(value, index);
-          });
-          return;
-        }
+        const copyInput = new PassThrough({ highWaterMark: 2 * 1024 * 1024 });
+        const copyStream = (client as unknown as { query: (query: unknown) => NodeJS.WritableStream }).query(copyFrom(`
+          COPY upload_profiles_stage (
+            id, name, gender, gender_probability, age, age_group,
+            country_id, country_name, country_probability
+          ) FROM STDIN WITH (FORMAT csv)
+        `));
+        const copyDone = pipeline(copyInput, copyStream);
 
-        totalRows += 1;
-        const extracted = extractUploadCandidate(headerIndex, row);
-        if (extracted.reason) {
-          incrementReason(summaryReasons, extracted.reason);
-          return;
-        }
+        req.setEncoding("utf8");
 
-        const candidate = extracted.candidate!;
-        if (seenNames.has(candidate.name)) {
-          incrementReason(summaryReasons, "duplicate_name");
-          return;
-        }
+        await new Promise<void>((resolve, reject) => {
+          req.on("data", (chunk: string) => {
+            const parsedRows = parser.push(chunk);
 
-        seenNames.add(candidate.name);
-        pendingBatch.push(candidate);
-        if (pendingBatch.length >= CSV_UPLOAD_BATCH_SIZE) {
-          await flushBatch();
-        }
-      };
-
-      const processChunk = async (chunk: string): Promise<void> => {
-        for (const row of parser.push(chunk)) {
-          await processParsedRow(row);
-        }
-      };
-
-      req.setEncoding("utf8");
-
-      await new Promise<void>((resolve, reject) => {
-        req.on("data", (chunk: string) => {
-          req.pause();
-          chain = chain
-            .then(() => processChunk(chunk))
-            .then(() => {
-              req.resume();
-            })
-            .catch((error) => {
-              reject(error);
-            });
-        });
-
-        req.once("end", () => {
-          chain
-            .then(async () => {
-              const finalRow = parser.finish();
-              if (finalRow) {
-                await processParsedRow(finalRow);
+            for (const row of parsedRows) {
+              if (headerIndex === null) {
+                const normalizedHeader = row.cells.map(normalizeCsvHeader);
+                headerIndex = new Map<string, number>();
+                normalizedHeader.forEach((value, index) => {
+                  if (!headerIndex!.has(value)) headerIndex!.set(value, index);
+                });
+                continue;
               }
-              await flushBatch();
-              resolve();
-            })
-            .catch(reject);
+
+              totalRows += 1;
+              const extracted = extractUploadCandidate(headerIndex, row);
+              if (extracted.reason) {
+                incrementReason(summaryReasons, extracted.reason);
+                continue;
+              }
+
+              const candidate = extracted.candidate!;
+              acceptedRows += 1;
+              if (!copyInput.write(serializeUploadCandidate(candidate))) {
+                req.pause();
+              }
+            }
+          });
+
+          copyInput.on("drain", () => {
+            req.resume();
+          });
+
+          req.once("end", () => {
+            const finalRow = parser.finish();
+            if (finalRow && headerIndex !== null) {
+              totalRows += 1;
+              const extracted = extractUploadCandidate(headerIndex, finalRow);
+              if (extracted.reason) {
+                incrementReason(summaryReasons, extracted.reason);
+              } else if (extracted.candidate) {
+                acceptedRows += 1;
+                copyInput.write(serializeUploadCandidate(extracted.candidate));
+              }
+            }
+            copyInput.end();
+          });
+
+          req.once("error", (err) => {
+            reject(err);
+          });
+          copyDone.then(resolve).catch(reject);
         });
 
-        req.once("error", reject);
-      });
+        const existingProfilesResult = await client.query("SELECT COUNT(*)::int AS total FROM profiles");
+        const existingProfiles = Number(existingProfilesResult.rows[0]?.total ?? 0);
+
+        await dropProfileSecondaryIndexes(client);
+        profileIndexesDropped = true;
+
+        if (existingProfiles === 0) {
+          await client.query(`DROP INDEX IF EXISTS ${PROFILE_UNIQUE_INDEX_NAME}`);
+          uniqueProfileIndexDropped = true;
+        }
+
+        // Now insert from temp table
+        await client.query("BEGIN");
+        try {
+          // Reduce durability for the merge transaction to speed up bulk load.
+          // This only applies for this transaction and improves throughput.
+          await client.query("SET LOCAL synchronous_commit = OFF");
+
+          const mergedResult = await client.query(
+            uniqueProfileIndexDropped
+              ? `
+                INSERT INTO profiles (
+                  id, name, gender, gender_probability, age, age_group,
+                  country_id, country_name, country_probability, created_at
+                )
+                SELECT DISTINCT ON (LOWER(name))
+                  id, name, gender, gender_probability, age, age_group,
+                  country_id, country_name, country_probability, NOW()
+                FROM upload_profiles_stage
+                ORDER BY LOWER(name), id
+              `
+              : `
+                INSERT INTO profiles (
+                  id, name, gender, gender_probability, age, age_group,
+                  country_id, country_name, country_probability, created_at
+                )
+                SELECT
+                  id, name, gender, gender_probability, age, age_group,
+                  country_id, country_name, country_probability, NOW()
+                FROM upload_profiles_stage
+                ON CONFLICT (LOWER(name)) DO NOTHING
+              `
+          );
+
+          inserted = mergedResult.rowCount ?? mergedResult.rows.length;
+          await client.query("COMMIT");
+        } catch (error) {
+          await client.query("ROLLBACK");
+          throw error;
+        }
+
+        incrementReason(summaryReasons, "duplicate_name", Math.max(0, acceptedRows - inserted));
+        clearQueryCache();
+
+        if (profileIndexesDropped || uniqueProfileIndexDropped) {
+          const rebuildUnique = uniqueProfileIndexDropped;
+          const rebuildSecondary = profileIndexesDropped;
+          profileIndexesDropped = false;
+          uniqueProfileIndexDropped = false;
+
+          void (async () => {
+            const rebuildClient = await pool.connect();
+            try {
+              if (rebuildUnique) {
+                await recreateProfileUniqueIndex(rebuildClient);
+              }
+              if (rebuildSecondary) {
+                await recreateProfileSecondaryIndexes(rebuildClient);
+              }
+            } catch (rebuildError) {
+              console.error("Failed to rebuild profiles indexes after upload:", rebuildError);
+            } finally {
+              rebuildClient.release();
+            }
+          })();
+        }
+      } finally {
+        client.release();
+      }
 
       const skipped = totalRows - inserted;
       const compactReasons = Object.fromEntries(

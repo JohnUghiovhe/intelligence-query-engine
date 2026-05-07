@@ -1,5 +1,5 @@
 {
-  "name": "insighta-labs+-backend",
+  "name": "insighta-labs-backend",
   "version": "1.0.0",
   "description": "",
   "main": "dist/server.js",
@@ -18,7 +18,8 @@
   "dependencies": {
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
-    "pg": "^8.16.3"
+    "pg": "^8.16.3",
+    "pg-copy-streams": "^7.0.0"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",

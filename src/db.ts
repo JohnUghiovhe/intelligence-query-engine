@@ -11,8 +11,15 @@ if (!databaseUrl) {
 
 export const pool = new Pool({
   connectionString: databaseUrl,
-  ssl: {
-    rejectUnauthorized: false
+  ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false
+});
+
+// Ensure session does not use a server-side statement timeout for long migrations
+pool.on("connect", async (client: PoolClient) => {
+  try {
+    await client.query("SET statement_timeout = 0");
+  } catch (err) {
+    // ignore failures setting session params
   }
 });
 
@@ -121,14 +128,19 @@ export const initializeDatabase = async (): Promise<void> => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    for (const profile of rows) {
-      await client.query(
-        `INSERT INTO profiles (
-           id, name, gender, gender_probability, age, age_group,
-           country_id, country_name, country_probability, created_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
-         ON CONFLICT (LOWER(name)) DO NOTHING`,
-        [
+    // Batch inserts in groups of 100 to improve performance
+    const batchSize = 100;
+    for (let i = 0; i < rows.length; i += batchSize) {
+      const batch = rows.slice(i, i + batchSize);
+      const values: Array<unknown> = [];
+      const placeholders: string[] = [];
+      let paramIndex = 1;
+
+      for (const profile of batch) {
+        placeholders.push(
+          `($${paramIndex++}, $${paramIndex++}, $${paramIndex++}, $${paramIndex++}, $${paramIndex++}, $${paramIndex++}, $${paramIndex++}, $${paramIndex++}, $${paramIndex++}, NOW())`
+        );
+        values.push(
           generateUuidV7(),
           String(profile.name).trim().toLowerCase(),
           profile.gender,
@@ -138,7 +150,16 @@ export const initializeDatabase = async (): Promise<void> => {
           String(profile.country_id).toUpperCase(),
           String(profile.country_name).trim(),
           Number(profile.country_probability)
-        ]
+        );
+      }
+
+      await client.query(
+        `INSERT INTO profiles (
+           id, name, gender, gender_probability, age, age_group,
+           country_id, country_name, country_probability, created_at
+         ) VALUES ${placeholders.join(", ")}
+         ON CONFLICT (LOWER(name)) DO NOTHING`,
+        values
       );
     }
     await client.query("COMMIT");
